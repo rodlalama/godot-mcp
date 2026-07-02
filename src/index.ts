@@ -90,6 +90,7 @@ class GodotServer {
     'directory': 'directory',
     'recursive': 'recursive',
     'scene': 'scene',
+    'warmup_frames': 'warmupFrames',
   };
 
   /**
@@ -1286,7 +1287,8 @@ class GodotServer {
       ? Math.max(1, Math.floor(args.warmupFrames))
       : 30;
     const outPath = join(tmpdir(), `godot-shot-${process.pid}-${Date.now()}.png`).replace(/\\/g, '/');
-    const runnerName = '.mcp_screenshot_runner.gd';
+    // Unique per run so concurrent captures can't clobber or delete each other's runner.
+    const runnerName = `.mcp_screenshot_runner-${process.pid}-${Date.now()}.gd`;
     const runnerPath = join(args.projectPath, runnerName);
 
     // A SceneTree main loop: instance the scene, render a few frames, capture, quit.
@@ -1322,13 +1324,20 @@ class GodotServer {
           ['--path', args.projectPath, '--script', `res://${runnerName}`, '--', scene, outPath, String(warmup)],
           { stdio: 'pipe' }
         );
+        const stderr: Buffer[] = [];
+        p.stderr?.on('data', (chunk: Buffer) => stderr.push(chunk));
         const timer = setTimeout(() => {
           p.kill();
           reject(new Error('Screenshot timed out after 30s'));
         }, 30000);
-        p.on('exit', () => {
+        p.on('exit', (code: number | null, signal: string | null) => {
           clearTimeout(timer);
-          resolve();
+          if (code === 0) {
+            resolve();
+          } else {
+            const detail = Buffer.concat(stderr).toString().trim();
+            reject(new Error(`Godot exited with ${code !== null ? `code ${code}` : `signal ${signal}`}${detail ? `: ${detail}` : ''}`));
+          }
         });
         p.on('error', (err: Error) => {
           clearTimeout(timer);
