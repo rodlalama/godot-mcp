@@ -9,7 +9,8 @@
 
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize } from 'path';
-import { existsSync, readdirSync, mkdirSync } from 'fs';
+import { existsSync, readdirSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
+import { tmpdir } from 'os';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
 
@@ -89,6 +90,7 @@ class GodotServer {
     'directory': 'directory',
     'recursive': 'recursive',
     'scene': 'scene',
+    'warmup_frames': 'warmupFrames',
   };
 
   /**
@@ -923,6 +925,32 @@ class GodotServer {
             required: ['projectPath'],
           },
         },
+        {
+          name: 'capture_screenshot',
+          description:
+            'Render a scene in a real (non-headless) Godot window and return a PNG screenshot. ' +
+            'Requires a GPU/display; --headless produces blank images.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scene: {
+                type: 'string',
+                description:
+                  "Scene to render, e.g. res://scenes/main.tscn. Defaults to res://scenes/main.tscn.",
+              },
+              warmupFrames: {
+                type: 'number',
+                description:
+                  'Frames to render before capturing (default 30). Increase to let the scene animate before the shot.',
+              },
+            },
+            required: ['projectPath'],
+          },
+        },
       ],
     }));
 
@@ -958,6 +986,8 @@ class GodotServer {
           return await this.handleGetUid(request.params.arguments);
         case 'update_project_uids':
           return await this.handleUpdateProjectUids(request.params.arguments);
+        case 'capture_screenshot':
+          return await this.handleCaptureScreenshot(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -1218,6 +1248,128 @@ class GodotServer {
         },
       ],
     };
+  }
+
+  /**
+   * Handle the capture_screenshot tool: render a scene in a real (non-headless)
+   * Godot window, save the frame to a temp PNG, and return it as image content.
+   *
+   * The runner GDScript is embedded here and written into the target project
+   * transiently (as a hidden file, removed afterward) so this tool works on any
+   * project without requiring a committed runner file.
+   */
+  private async handleCaptureScreenshot(args: any) {
+    args = this.normalizeParameters(args);
+
+    if (!args.projectPath || !this.validatePath(args.projectPath)) {
+      return this.createErrorResponse('A valid projectPath is required', [
+        'Provide a valid path to a Godot project directory',
+      ]);
+    }
+    if (!existsSync(join(args.projectPath, 'project.godot'))) {
+      return this.createErrorResponse(`Not a valid Godot project: ${args.projectPath}`, [
+        'Ensure the path points to a directory containing a project.godot file',
+      ]);
+    }
+
+    if (!this.godotPath) {
+      await this.detectGodotPath();
+      if (!this.godotPath) {
+        return this.createErrorResponse('Could not find a valid Godot executable path', [
+          'Ensure Godot is installed correctly',
+          'Set GODOT_PATH environment variable to specify the correct path',
+        ]);
+      }
+    }
+
+    const scene: string = args.scene || 'res://scenes/main.tscn';
+    const warmup: number = Number.isFinite(args.warmupFrames)
+      ? Math.max(1, Math.floor(args.warmupFrames))
+      : 30;
+    const outPath = join(tmpdir(), `godot-shot-${process.pid}-${Date.now()}.png`).replace(/\\/g, '/');
+    // Unique per run so concurrent captures can't clobber or delete each other's runner.
+    const runnerName = `.mcp_screenshot_runner-${process.pid}-${Date.now()}.gd`;
+    const runnerPath = join(args.projectPath, runnerName);
+
+    // A SceneTree main loop: instance the scene, render a few frames, capture, quit.
+    const runnerScript = [
+      'extends SceneTree',
+      'func _initialize() -> void:',
+      '\t_run()',
+      'func _run() -> void:',
+      '\tvar a := OS.get_cmdline_user_args()',
+      '\tvar scene_path: String = a[0] if a.size() > 0 else "res://scenes/main.tscn"',
+      '\tvar out_path: String = a[1] if a.size() > 1 else "user://shot.png"',
+      '\tvar warmup: int = int(a[2]) if a.size() > 2 else 30',
+      '\tvar packed = load(scene_path)',
+      '\tif packed == null:',
+      '\t\tpush_error("screenshot: could not load scene " + scene_path)',
+      '\t\tquit(1)',
+      '\t\treturn',
+      '\troot.add_child(packed.instantiate())',
+      '\tfor _i in warmup:',
+      '\t\tawait process_frame',
+      '\tvar img := root.get_viewport().get_texture().get_image()',
+      '\timg.save_png(out_path)',
+      '\tquit()',
+      '',
+    ].join('\n');
+
+    try {
+      writeFileSync(runnerPath, runnerScript);
+
+      await new Promise<void>((resolve, reject) => {
+        const p = spawn(
+          this.godotPath!,
+          ['--path', args.projectPath, '--script', `res://${runnerName}`, '--', scene, outPath, String(warmup)],
+          { stdio: 'pipe' }
+        );
+        const stderr: Buffer[] = [];
+        p.stderr?.on('data', (chunk: Buffer) => stderr.push(chunk));
+        const timer = setTimeout(() => {
+          p.kill();
+          reject(new Error('Screenshot timed out after 30s'));
+        }, 30000);
+        p.on('exit', (code: number | null, signal: string | null) => {
+          clearTimeout(timer);
+          if (code === 0) {
+            resolve();
+          } else {
+            const detail = Buffer.concat(stderr).toString().trim();
+            reject(new Error(`Godot exited with ${code !== null ? `code ${code}` : `signal ${signal}`}${detail ? `: ${detail}` : ''}`));
+          }
+        });
+        p.on('error', (err: Error) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+      });
+
+      if (!existsSync(outPath)) {
+        return this.createErrorResponse('Godot did not produce a screenshot', [
+          'Ensure a display/GPU is available — a real window must open (--headless renders blank)',
+          `Verify the scene exists: ${scene}`,
+        ]);
+      }
+
+      const data = readFileSync(outPath).toString('base64');
+      return {
+        content: [{ type: 'image', data, mimeType: 'image/png' }],
+      };
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Unknown error';
+      return this.createErrorResponse(`Failed to capture screenshot: ${msg}`, [
+        'Ensure Godot can open a window on this machine',
+        'Try increasing warmupFrames',
+      ]);
+    } finally {
+      try {
+        if (existsSync(runnerPath)) unlinkSync(runnerPath);
+      } catch {}
+      try {
+        if (existsSync(outPath)) unlinkSync(outPath);
+      } catch {}
+    }
   }
 
   /**
